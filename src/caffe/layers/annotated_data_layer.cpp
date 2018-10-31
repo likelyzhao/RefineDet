@@ -1,5 +1,6 @@
 #ifdef USE_OPENCV
 #include <opencv2/core/core.hpp>
+#include <opencv2/opencv.hpp>
 #endif  // USE_OPENCV
 #include <stdint.h>
 
@@ -12,6 +13,7 @@
 #include "caffe/util/benchmark.hpp"
 #include "caffe/util/sampler.hpp"
 
+static int countimg =0;
 namespace caffe {
 
 template <typename Dtype>
@@ -57,7 +59,7 @@ void AnnotatedDataLayer<Dtype>::DataLayerSetUp(
   top_shape[0] = batch_size;
   top[0]->Reshape(top_shape);
   for (int i = 0; i < this->PREFETCH_COUNT; ++i) {
-    this->prefetch_[i].data_.Reshape(top_shape);
+    this->prefetch_[i].data_.Reshape(top_shape);//load prefetch
   }
   LOG(INFO) << "output data size: " << top[0]->num() << ","
       << top[0]->channels() << "," << top[0]->height() << ","
@@ -85,6 +87,7 @@ void AnnotatedDataLayer<Dtype>::DataLayerSetUp(
         // Note: Refer to caffe.proto for details about group_label and
         // instance_id.
         for (int g = 0; g < anno_datum.annotation_group_size(); ++g) {
+          LOG(INFO)<<"labelbbox :"<<anno_datum.annotation_group(g).annotation_size();
           num_bboxes += anno_datum.annotation_group(g).annotation_size();
         }
         label_shape[0] = 1;
@@ -103,6 +106,46 @@ void AnnotatedDataLayer<Dtype>::DataLayerSetUp(
     top[1]->Reshape(label_shape);
     for (int i = 0; i < this->PREFETCH_COUNT; ++i) {
       this->prefetch_[i].label_.Reshape(label_shape);
+    }
+  }
+}
+
+template<typename Dtype>
+void BolbToMat(Blob<Dtype>* transformed_blob,std::vector<cv::Mat> &mat_vector){
+    const int mat_num = mat_vector.size();
+    const int num = transformed_blob->num();
+    const int channels = transformed_blob->channels();
+    const int height = transformed_blob->height();
+    const int width = transformed_blob->width();
+
+    CHECK_GT(num, 0) << "There is no MAT to add";
+    LOG(INFO)<<"num ="<<num;
+    //Blob<Dtype> uni_blob(1, channels, height, width);
+    for (int item_id = 0; item_id < num; ++item_id) {
+      int offset = transformed_blob->offset(item_id);
+
+      if (channels ==3){
+        cv::Mat temp_mat = cv::Mat(height,width,CV_32FC3,transformed_blob->mutable_cpu_data() + offset);
+        cv::Mat new_temp;
+        temp_mat.convertTo(new_temp,CV_8UC3,255);
+        mat_vector.push_back(new_temp);
+      }
+
+      //uni_blob.set_cpu_data(transformed_blob->mutable_cpu_data() + offset);
+      //Transform(mat_vector[item_id], &uni_blob);
+    }
+
+}
+
+
+static void GroupObjectBBoxesV2(const AnnotatedDatum& anno_datum,
+                       vector<NormalizedBBox>* object_bboxes) {
+  object_bboxes->clear();
+  for (int i = 0; i < anno_datum.annotation_group_size(); ++i) {
+    const AnnotationGroup& anno_group = anno_datum.annotation_group(i);
+    for (int j = 0; j < anno_group.annotation_size(); ++j) {
+      const Annotation& anno = anno_group.annotation(j);
+      object_bboxes->push_back(anno.bbox());
     }
   }
 }
@@ -148,6 +191,9 @@ void AnnotatedDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
     timer.Start();
     // get a anno_datum
     AnnotatedDatum& anno_datum = *(reader_.full().pop("Waiting for data"));
+    vector<NormalizedBBox> object_bboxes;
+    GroupObjectBBoxesV2(anno_datum, &object_bboxes);
+    LOG(INFO)<<"object_bboxes_size = "<< object_bboxes.size() <<" imageidx="<<countimg + item_id;
     read_time += timer.MicroSeconds();
     timer.Start();
     AnnotatedDatum distort_datum;
@@ -170,7 +216,7 @@ void AnnotatedDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
         expand_datum = &anno_datum;
       }
     }
-    AnnotatedDatum* sampled_datum = NULL;
+    AnnotatedDatum* sampled_datum = NULL;// expand  and distort
     bool has_sampled = false;
     if (batch_samplers_.size() > 0) {
       // Generate sampled bboxes from expand_datum.
@@ -230,6 +276,7 @@ void AnnotatedDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
         if (anno_type_ == AnnotatedDatum_AnnotationType_BBOX) {
           // Count the number of bboxes.
           for (int g = 0; g < transformed_anno_vec.size(); ++g) {
+              LOG(INFO)<<"transformbbox :"<<transformed_anno_vec[g].annotation_size();
             num_bboxes += transformed_anno_vec[g].annotation_size();
           }
         } else {
@@ -259,6 +306,10 @@ void AnnotatedDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
     reader_.free().push(const_cast<AnnotatedDatum*>(&anno_datum));
   }
 
+  vector<cv::Mat> mat_vector;
+
+  this->data_transformer_->TransformInv((&batch->data_),&mat_vector);
+
   // Store "rich" annotation if needed.
   if (this->output_labels_ && has_anno_type_) {
     vector<int> label_shape(4);
@@ -277,7 +328,9 @@ void AnnotatedDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
         batch->label_.Reshape(label_shape);
         top_label = batch->label_.mutable_cpu_data();
         int idx = 0;
+        CHECK_EQ(mat_vector.size(),batch_size);
         for (int item_id = 0; item_id < batch_size; ++item_id) {
+          cv::Mat temp_img = mat_vector[item_id];
           const vector<AnnotationGroup>& anno_vec = all_anno[item_id];
           for (int g = 0; g < anno_vec.size(); ++g) {
             const AnnotationGroup& anno_group = anno_vec[g];
@@ -292,8 +345,22 @@ void AnnotatedDataLayer<Dtype>::load_batch(Batch<Dtype>* batch) {
               top_label[idx++] = bbox.xmax();
               top_label[idx++] = bbox.ymax();
               top_label[idx++] = bbox.difficult();
+              int imagesize = temp_img.cols;
+//              LOG(INFO)<<"bbox.xmin"<<bbox.xmin()*imagesize;
+//              LOG(INFO)<<"bbox.ymin"<<bbox.ymin()*imagesize;
+//              LOG(INFO)<<"bbox.xmax"<<bbox.xmax()*imagesize;
+//              LOG(INFO)<<"bbox.ymax"<<bbox.ymax()*imagesize;
+//              LOG(INFO)<<"imageidx="<<countimg;
+              rectangle(temp_img, cv::Point(int(bbox.xmin()*imagesize), int(bbox.ymin()*imagesize)),
+                        cv::Point(int(bbox.xmax()*imagesize),int(bbox.ymax()*imagesize)),
+                        cv::Scalar(255,0,0,0));
             }
           }
+          std::ostringstream   ostr;
+          ostr   << "save_" << countimg++ << ".jpg";
+          std::string saveName = ostr.str();
+          cv::imwrite(saveName,temp_img);
+
         }
       }
     } else {

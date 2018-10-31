@@ -354,6 +354,17 @@ bool ReadXMLToAnnotatedDatum(const string& labelfile, const int img_height,
       }
     }
   }
+  vector<NormalizedBBox> object_bboxes;
+  object_bboxes.clear();
+  for (int i = 0; i < anno_datum->annotation_group_size(); ++i) {
+    const AnnotationGroup& anno_group = anno_datum->annotation_group(i);
+    for (int j = 0; j < anno_group.annotation_size(); ++j) {
+      const Annotation& anno = anno_group.annotation(j);
+      object_bboxes.push_back(anno.bbox());
+    }
+  }
+  LOG(INFO)<<"labelname = "<<labelfile;
+  LOG(INFO) << "objectsize ="<<object_bboxes.size();
   return true;
 }
 
